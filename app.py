@@ -336,13 +336,17 @@ def split_into_teams(names: list[str], mode_preset: str = "랜덤", team_a_size:
 # ─────────────────────────────────────────
 # 대본 품질 검증
 # ─────────────────────────────────────────
-def validate_script(script: str, result: dict) -> list[str]:
+def validate_script(script: str, result: dict, char_names: dict = None,
+                    direction_density: str = "보통") -> list[str]:
+    if char_names is None:
+        char_names = {}
     warnings = []
-    all_characters = [name for team in result["teams"] for name in team]
-    for char in all_characters:
-        if char not in script:
-            warnings.append(f"'{char}'의 대사가 대본에서 발견되지 않았습니다.")
-    if script.count("(") < 2:
+    all_actors = [name for team in result["teams"] for name in team]
+    for actor in all_actors:
+        role = char_names.get(actor, actor)
+        if role not in script and actor not in script:
+            warnings.append(f"'{role or actor}'의 대사가 대본에서 발견되지 않았습니다.")
+    if direction_density != "없음" and script.count("(") < 2:
         warnings.append("행동지문(괄호)이 거의 없습니다. AI가 형식 지시를 무시했을 수 있습니다.")
     return warnings
 
@@ -350,32 +354,68 @@ def validate_script(script: str, result: dict) -> list[str]:
 # ─────────────────────────────────────────
 # Gemini 프롬프트 / 생성 함수
 # ─────────────────────────────────────────
+def build_cast_info(result: dict, char_names: dict) -> str:
+    """배우이름과 역할명을 조합해 출연진 문자열을 만듭니다."""
+    def label(actor: str) -> str:
+        role = char_names.get(actor, "")
+        return f"{role}({actor})" if role else actor
+
+    mode = result["mode"]
+    teams = result["teams"]
+    if mode == "monologue":
+        return f"1인 독백 — 출연자: {label(teams[0][0])}"
+    elif mode == "ensemble":
+        return f"전체 앙상블 — 출연자: {', '.join(label(a) for a in teams[0])}"
+    else:
+        parts = [f"팀 {chr(65+i)}: {', '.join(label(a) for a in team)}"
+                 for i, team in enumerate(teams)]
+        return " / ".join(parts)
+
+
+DIRECTION_RULES = {
+    "없음": "지문(행동 묘사)은 작성하지 않습니다. 대사만으로 씬을 구성하세요.",
+    "적게": "지문(행동 묘사)은 장면 전환이나 씬의 시작·끝처럼 꼭 필요한 경우에만 괄호( )로 작성합니다. 예: (문을 열며)",
+    "보통": "지문(행동 묘사)은 감정이 크게 변하는 순간에만 괄호( )로 작성합니다. 대사 3~4개당 1개 정도가 적당합니다. 예: (잠시 침묵하며)",
+    "많이": "지문(행동 묘사)은 거의 모든 대사에 괄호( )로 상세히 작성합니다. 예: (테이블을 주먹으로 치며), (눈을 피하며 창밖을 바라보며)",
+}
+
+
 def build_prompt(result: dict, genre: str, mood: str, situation: str,
                  script_lines: int = 5, monologue_type: str = "내면 독백",
-                 variation_hint: str = "") -> str:
+                 variation_hint: str = "", char_names: dict = None,
+                 direction_density: str = "보통") -> str:
+    if char_names is None:
+        char_names = {}
     mode = result["mode"]
     teams = result["teams"]
 
+    cast_info = build_cast_info(result, char_names)
+    has_roles = bool(char_names)
+
     if mode == "monologue":
-        cast_info = f"1인 독백 — 출연자: {teams[0][0]}"
         scene_type = (
-            f"내면 독백 씬 (인물의 내면 생각과 감정을 말하는 방식)"
+            "내면 독백 씬 (인물의 내면 생각과 감정을 말하는 방식)"
             if monologue_type == "내면 독백"
             else "관객 독백 씬 (관객에게 직접 말을 거는 방식)"
         )
         lines_rule = f"독백 대사를 정확히 {script_lines}개 작성합니다."
     elif mode == "ensemble":
-        members = ", ".join(teams[0])
-        cast_info = f"전체 앙상블 — 출연자: {members}"
         scene_type = "앙상블 씬 (모든 출연자가 함께 등장)"
         lines_rule = f"각 캐릭터가 정확히 {script_lines}번씩 대사를 주고받는 분량으로 작성합니다."
     else:
-        team_texts = [f"팀 {chr(65+i)}: {', '.join(team)}" for i, team in enumerate(teams)]
-        cast_info = " / ".join(team_texts)
         scene_type = "유닛 분할 씬 (각 팀이 별개의 장면에서 등장, 팀별로 나누어 작성)"
         lines_rule = f"각 캐릭터가 정확히 {script_lines}번씩 대사를 주고받는 분량으로 작성합니다."
 
     variation_line = f"\n- 창작 방향 힌트: {variation_hint}" if variation_hint else ""
+    direction_rule = DIRECTION_RULES[direction_density]
+
+    if has_roles:
+        name_rule = (
+            "대사 형식은 반드시 '역할명(배우명): 대사' 형태로 작성합니다. "
+            "예: 과거에 상처를 준 친구(동석): 오랜만이야. — 출연진에 표기된 역할명과 배우명을 그대로 사용합니다."
+        )
+    else:
+        name_rule = "형식은 '이름: 대사' 형태로 작성합니다."
 
     return f"""
 당신은 전문 연기 대본 작가입니다. 아래 조건에 맞는 연기 연습용 단막극 대본을 작성해주세요.
@@ -389,20 +429,21 @@ def build_prompt(result: dict, genre: str, mood: str, situation: str,
 
 [작성 규칙]
 1. 대본은 반드시 한국어로 작성합니다.
-2. 출연자 이름을 그대로 캐릭터 이름으로 사용합니다.
-3. 형식은 아래처럼 "이름: 대사" 형태로 작성합니다.
-4. 지문(행동 묘사)은 반드시 괄호( )로 감쌉니다. 예: (문을 열며), (잠시 침묵하며), (테이블을 주먹으로 치며)
-5. {lines_rule}
-6. 대본 앞에 씬 제목과 간단한 배경 설명(2~3줄)을 넣어주세요.
-7. 유닛 분할인 경우 팀별로 구분선(───)을 넣어 각 팀의 씬을 분리해주세요.
+2. {name_rule}
+3. {direction_rule}
+4. {lines_rule}
+5. 대본 앞에 씬 제목과 간단한 배경 설명(2~3줄)을 넣어주세요.
+6. 유닛 분할인 경우 팀별로 구분선(───)을 넣어 각 팀의 씬을 분리해주세요.
 
 지금 바로 대본을 작성해주세요.
 """.strip()
 
 
 def generate_script(result, genre, mood, situation, script_lines=5,
-                    monologue_type="내면 독백", variation_hint="") -> str:
-    prompt = build_prompt(result, genre, mood, situation, script_lines, monologue_type, variation_hint)
+                    monologue_type="내면 독백", variation_hint="",
+                    char_names=None, direction_density="보통") -> str:
+    prompt = build_prompt(result, genre, mood, situation, script_lines, monologue_type,
+                          variation_hint, char_names, direction_density)
     return call_gemini(prompt)
 
 
@@ -486,9 +527,15 @@ def render_script_box(script: str, font_size: int, show_line_numbers: bool = Tru
     )
 
 
-def render_team_result(result: dict):
+def render_team_result(result: dict, char_names: dict = None):
+    if char_names is None:
+        char_names = {}
     mode = result["mode"]
     teams = result["teams"]
+
+    def badge_label(actor: str) -> str:
+        role = char_names.get(actor, "")
+        return f"{role}<br><small style='color:#aaa'>({actor})</small>" if role else actor
     mode_labels = {"monologue": "🎤 독백 모드", "ensemble": "🎭 전체 앙상블", "unit": "⚡ 유닛 분할"}
     mode_descriptions = {
         "monologue": "혼자만의 무대! 독백 씬을 연습합니다.",
@@ -500,15 +547,15 @@ def render_team_result(result: dict):
     st.divider()
 
     if mode == "monologue":
-        name = teams[0][0]
+        actor = teams[0][0]
         st.markdown(f"""
         <div class="monologue-card">
-            <h2 style="color:#38ef7d; margin:0;">🌟 {name}</h2>
+            <h2 style="color:#38ef7d; margin:0;">🌟 {badge_label(actor)}</h2>
             <p style="color:#cccccc; margin-top:8px;">솔로 퍼포먼스 — 당신만의 무대입니다</p>
         </div>
         """, unsafe_allow_html=True)
     elif mode == "ensemble":
-        members_html = "".join(f'<span class="member-badge">🎭 {m}</span>' for m in teams[0])
+        members_html = "".join(f'<span class="member-badge">🎭 {badge_label(m)}</span>' for m in teams[0])
         st.markdown(f'<div class="team-card"><h3>앙상블 팀 전체</h3>{members_html}</div>',
                     unsafe_allow_html=True)
     else:
@@ -517,7 +564,7 @@ def render_team_result(result: dict):
         for idx, (col, team) in enumerate(zip(cols, teams)):
             with col:
                 icon = team_icons[idx % len(team_icons)]
-                members_html = "".join(f'<span class="member-badge">{m}</span>' for m in team)
+                members_html = "".join(f'<span class="member-badge">{badge_label(m)}</span>' for m in team)
                 st.markdown(f"""
                 <div class="team-card">
                     <h3>{icon} 팀 {chr(65+idx)} &nbsp;·&nbsp; {len(team)}명</h3>
@@ -540,22 +587,36 @@ with st.sidebar:
     st.divider()
 
     st.subheader("✍️ 이름 입력")
+    st.caption("역할명을 입력하면 대본에 `역할명(배우명):` 형식으로 표기됩니다.")
     names = []
+    char_names = {}  # {배우이름: 역할/캐릭터이름}
     if num_people <= 6:
         for i in range(num_people):
-            name = st.text_input(
-                label=f"참여자 {i + 1}",
-                value=f"배우{i + 1}",
-                placeholder=f"참여자 {i + 1} 이름",
-                key=f"name_{i}",
-            )
-            names.append(name.strip() if name.strip() else f"참여자{i+1}")
+            col_n, col_r = st.columns(2)
+            with col_n:
+                name = st.text_input(
+                    label=f"배우 {i + 1}",
+                    value=f"배우{i + 1}",
+                    placeholder="배우 이름",
+                    key=f"name_{i}",
+                )
+            with col_r:
+                role = st.text_input(
+                    label=f"역할명 {i + 1}",
+                    value="",
+                    placeholder="역할명 (선택)",
+                    key=f"role_{i}",
+                )
+            actor = name.strip() if name.strip() else f"참여자{i+1}"
+            names.append(actor)
+            if role.strip():
+                char_names[actor] = role.strip()
     else:
         default_names = ", ".join(f"배우{i+1}" for i in range(num_people))
         raw = st.text_area(
-            f"이름 {num_people}개를 쉼표로 구분해 입력",
+            f"배우 이름 {num_people}개를 쉼표로 구분해 입력",
             value=default_names,
-            height=100,
+            height=80,
             help="예: 김철수, 이영희, 박민준 ...",
             key="names_bulk",
         )
@@ -563,6 +624,17 @@ with st.sidebar:
         while len(parsed) < num_people:
             parsed.append(f"참여자{len(parsed)+1}")
         names = parsed[:num_people]
+        raw_roles = st.text_area(
+            "역할명을 쉼표로 구분해 입력 (선택)",
+            value="",
+            height=80,
+            placeholder="예: 형사, 용의자, 목격자 ...",
+            key="roles_bulk",
+        )
+        parsed_roles = [r.strip() for r in raw_roles.split(",") if r.strip()]
+        for actor, role in zip(names, parsed_roles):
+            if role:
+                char_names[actor] = role
         st.caption(f"인식된 이름: {' · '.join(names)}")
 
     st.divider()
@@ -603,6 +675,13 @@ with st.sidebar:
     script_lines = st.slider(lines_label, min_value=3, max_value=10, value=5, step=1,
                              help="많을수록 분량이 늘어납니다.")
 
+    direction_density = st.select_slider(
+        "행동지문 양",
+        options=["없음", "적게", "보통", "많이"],
+        value="보통",
+        help="없음: 지문 생략 / 적게: 장면 전환 시에만 / 보통: 감정 변화마다 / 많이: 모든 대사에 포함",
+    )
+
     st.divider()
 
     st.subheader("🔤 화면 설정")
@@ -629,6 +708,7 @@ if split_btn:
         st.warning("⚠️ 모든 참여자의 이름을 입력해 주세요.")
     else:
         st.session_state["team_result"] = split_into_teams(names, team_mode, team_a_size)
+        st.session_state["char_names"] = char_names
         st.session_state["script"] = None
         st.session_state["script_stack"] = []
         st.session_state["script_alt"] = None
@@ -636,7 +716,8 @@ if split_btn:
 
 if st.session_state["team_result"]:
     result = st.session_state["team_result"]
-    render_team_result(result)
+    saved_char_names = st.session_state.get("char_names", {})
+    render_team_result(result, saved_char_names)
     st.divider()
 
     gen_btn = st.button("📝 AI 대본 생성하기", use_container_width=True, type="primary")
@@ -646,10 +727,11 @@ if st.session_state["team_result"]:
             st.write("Gemini AI에 요청 중...")
             try:
                 script_text = generate_script(
-                    result, genre, mood, situation, script_lines, monologue_type
+                    result, genre, mood, situation, script_lines, monologue_type,
+                    char_names=saved_char_names, direction_density=direction_density,
                 )
                 st.write("품질 검사 중...")
-                warnings = validate_script(script_text, result)
+                warnings = validate_script(script_text, result, saved_char_names, direction_density)
                 st.write("히스토리 저장 중...")
                 save_to_history(script_text, genre, mood)
                 st.session_state["script"] = script_text
@@ -662,7 +744,7 @@ if st.session_state["team_result"]:
                 st.error(f"대본 생성 중 오류가 발생했습니다: {e}")
 
     if st.session_state.get("script"):
-        warnings = validate_script(st.session_state["script"], result)
+        warnings = validate_script(st.session_state["script"], result, saved_char_names, direction_density)
         for w in warnings:
             st.markdown(f'<div class="warn-badge">⚠️ {w}</div>', unsafe_allow_html=True)
 
@@ -712,7 +794,8 @@ if st.session_state["team_result"]:
                 try:
                     alt = generate_script(
                         result, genre, mood, situation, script_lines,
-                        monologue_type, variation_hint=hint
+                        monologue_type, variation_hint=hint,
+                        char_names=saved_char_names, direction_density=direction_density,
                     )
                     st.session_state["script_alt"] = alt
                     status.update(label="✅ 완료!", state="complete")
