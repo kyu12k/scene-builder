@@ -675,10 +675,11 @@ with st.sidebar:
     script_lines = st.slider(lines_label, min_value=3, max_value=10, value=5, step=1,
                              help="많을수록 분량이 늘어납니다.")
 
-    direction_density = st.select_slider(
+    direction_density = st.radio(
         "행동지문 양",
         options=["없음", "적게", "보통", "많이"],
-        value="보통",
+        index=2,
+        horizontal=True,
         help="없음: 지문 생략 / 적게: 장면 전환 시에만 / 보통: 감정 변화마다 / 많이: 모든 대사에 포함",
     )
 
